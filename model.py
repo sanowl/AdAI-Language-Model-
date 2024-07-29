@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 from transformers import GPT2Tokenizer
 from datasets import load_dataset
@@ -11,7 +11,10 @@ import logging
 from tqdm import tqdm
 import argparse
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+import random
+import numpy as np
+from collections import deque
 
 # Set environment variable to fall back to CPU for unsupported operations
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -62,8 +65,24 @@ class SmallTransformerModel(nn.Module):
         logits = self.fc(transformer_output)
         return logits
 
-def tokenize_function(examples: Dict[str, List[str]], tokenizer: GPT2Tokenizer, max_length: int) -> Dict[str, List[int]]:
-    return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=max_length)
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def tokenize_and_augment(examples: Dict[str, List[str]], tokenizer: GPT2Tokenizer, max_length: int) -> Dict[str, List[int]]:
+    tokenized = tokenizer(examples['text'], padding='max_length', truncation=True, max_length=max_length)
+    
+    # Simple data augmentation: randomly mask some tokens
+    masked_input_ids = []
+    for input_ids in tokenized['input_ids']:
+        mask_prob = 0.15
+        masked = [token if random.random() > mask_prob else tokenizer.mask_token_id for token in input_ids]
+        masked_input_ids.append(masked)
+    
+    tokenized['input_ids'] = masked_input_ids
+    return tokenized
 
 @torch.no_grad()
 def generate_text(model: nn.Module, tokenizer: GPT2Tokenizer, prompt: str, device: torch.device, max_length: int = 50, temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9) -> str:
@@ -98,9 +117,11 @@ def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 0
         logits[indices_to_remove] = filter_value
     return logits
 
-def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: optim.Optimizer, scheduler: OneCycleLR, device: torch.device, num_epochs: int, tokenizer: GPT2Tokenizer, writer: SummaryWriter) -> nn.Module:
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: optim.Optimizer, scheduler: OneCycleLR, device: torch.device, num_epochs: int, tokenizer: GPT2Tokenizer, writer: SummaryWriter, patience: int = 3) -> Tuple[nn.Module, float]:
     criterion = nn.CrossEntropyLoss()
     best_val_loss = float('inf')
+    best_model = None
+    early_stopping_counter = 0
     
     for epoch in range(num_epochs):
         model.train()
@@ -133,14 +154,22 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_small_transformer_model.pth')
+            best_model = model.state_dict()
+            torch.save(best_model, 'best_small_transformer_model.pth')
             logging.info("New best model saved")
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+            if early_stopping_counter >= patience:
+                logging.info(f"Early stopping triggered after {epoch+1} epochs")
+                break
         
         sample_prompt = "Once upon a time"
         sample_text = generate_text(model, tokenizer, sample_prompt, device)
         logging.info(f"Sample generated text: {sample_text}")
     
-    return model
+    model.load_state_dict(best_model)
+    return model, best_val_loss
 
 def validate_model(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
     model.eval()
@@ -156,24 +185,32 @@ def validate_model(model: nn.Module, val_loader: DataLoader, criterion: nn.Modul
 
 def chat_with_model(model: nn.Module, tokenizer: GPT2Tokenizer, device: torch.device):
     print("Chat with the model (type 'quit' to exit):")
+    conversation_history = deque(maxlen=5)  # Store last 5 exchanges
     while True:
         user_input = input("You: ")
         if user_input.lower() == 'quit':
             break
         try:
-            response = generate_text(model, tokenizer, user_input, device, max_length=100)
+            # Construct prompt with conversation history
+            prompt = " ".join(conversation_history) + " " + user_input
+            response = generate_text(model, tokenizer, prompt, device, max_length=100)
             print("Model:", response)
+            
+            # Update conversation history
+            conversation_history.append(user_input)
+            conversation_history.append(response)
         except Exception as e:
             logging.error(f"Error generating response: {str(e)}")
             print("Model: I'm sorry, I couldn't generate a response. Please try again.")
 
 def main(args: argparse.Namespace):
+    set_seed(args.seed)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
 
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.add_special_tokens({'pad_token': '[PAD]', 'mask_token': '[MASK]'})
 
     try:
         dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
@@ -184,11 +221,11 @@ def main(args: argparse.Namespace):
 
     max_length = args.max_length
     tokenized_datasets = dataset.map(
-        lambda examples: tokenize_function(examples, tokenizer, max_length), 
+        lambda examples: tokenize_and_augment(examples, tokenizer, max_length), 
         batched=True, 
         remove_columns=['text']
     )
-    logging.info("Dataset tokenized")
+    logging.info("Dataset tokenized and augmented")
 
     full_dataset = TextDataset(tokenized_datasets)
 
@@ -212,13 +249,9 @@ def main(args: argparse.Namespace):
 
     logging.info("Starting training...")
     try:
-        trained_model = train_model(model, train_loader, val_loader, optimizer, scheduler, device, args.num_epochs, tokenizer, writer)
+        trained_model, best_val_loss = train_model(model, train_loader, val_loader, optimizer, scheduler, device, args.num_epochs, tokenizer, writer)
         torch.save(trained_model.state_dict(), 'final_small_transformer_model.pth')
-        logging.info("Final model saved")
-        
-        # Validate the model before starting the chat
-        val_loss = validate_model(trained_model, val_loader, nn.CrossEntropyLoss(), device)
-        logging.info(f"Final validation loss: {val_loss:.4f}")
+        logging.info(f"Final model saved. Best validation loss: {best_val_loss:.4f}")
         
         chat_with_model(trained_model, tokenizer, device)
     except Exception as e:
@@ -234,8 +267,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers", type=int, default=2, help="Number of transformer layers")
     parser.add_argument("--max_length", type=int, default=128, help="Maximum sequence length")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
     
     main(args)
