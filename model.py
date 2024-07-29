@@ -10,6 +10,10 @@ import time
 import logging
 from tqdm import tqdm
 import argparse
+import os
+
+# Set environment variable to fall back to CPU for unsupported operations
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 class TextDataset(Dataset):
     def __init__(self, dataset):
@@ -51,7 +55,7 @@ class SmallTransformerModel(nn.Module):
         embeddings = self.dropout(embeddings)
 
         if attention_mask is not None:
-            padding_mask = ~attention_mask.bool()
+            padding_mask = attention_mask.logical_not()
         else:
             padding_mask = None
 
@@ -165,7 +169,7 @@ def chat_with_model(model, tokenizer, device):
 
 def main(args):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_built() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
 
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
@@ -182,18 +186,16 @@ def main(args):
     )
     logging.info("Dataset tokenized")
 
-    # Create a single TextDataset instance
     full_dataset = TextDataset(tokenized_datasets)
 
-    # Split the dataset into train and validation
     train_size = int(0.9 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
     logging.info("PyTorch datasets created")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     logging.info(f"Data loaders created. Batch size: {args.batch_size}")
 
     model = SmallTransformerModel(len(tokenizer), args.embedding_dim, args.num_heads, args.hidden_dim, args.num_layers, max_length).to(device)
@@ -205,15 +207,16 @@ def main(args):
     writer = SummaryWriter()
 
     logging.info("Starting training...")
-    trained_model = train_model(model, train_loader, val_loader, optimizer, scheduler, device, args.num_epochs, tokenizer, writer)
-
-    torch.save(trained_model.state_dict(), 'final_small_transformer_model.pth')
-    logging.info("Final model saved")
-
-    writer.close()
-
-    # Start interactive chat
-    chat_with_model(trained_model, tokenizer, device)
+    try:
+        trained_model = train_model(model, train_loader, val_loader, optimizer, scheduler, device, args.num_epochs, tokenizer, writer)
+        torch.save(trained_model.state_dict(), 'final_small_transformer_model.pth')
+        logging.info("Final model saved")
+        writer.close()
+        chat_with_model(trained_model, tokenizer, device)
+    except Exception as e:
+        logging.error(f"An error occurred during training: {str(e)}")
+    finally:
+        writer.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a small transformer model")
