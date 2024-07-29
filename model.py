@@ -11,18 +11,19 @@ import logging
 from tqdm import tqdm
 import argparse
 import os
+from typing import List, Dict, Any
 
 # Set environment variable to fall back to CPU for unsupported operations
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 class TextDataset(Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset: Any):
         self.dataset = dataset
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = self.dataset[idx]
         return {
             'input_ids': torch.tensor(item['input_ids'], dtype=torch.long),
@@ -30,7 +31,7 @@ class TextDataset(Dataset):
         }
 
 class SmallTransformerModel(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, num_heads, hidden_dim, num_layers, max_length, dropout=0.1):
+    def __init__(self, vocab_size: int, embedding_dim: int, num_heads: int, hidden_dim: int, num_layers: int, max_length: int, dropout: float = 0.1):
         super(SmallTransformerModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.pos_embedding = nn.Embedding(max_length, embedding_dim)
@@ -47,46 +48,42 @@ class SmallTransformerModel(nn.Module):
         self.fc = nn.Linear(embedding_dim, vocab_size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         seq_length = input_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device).unsqueeze(0)
         
         embeddings = self.embedding(input_ids) + self.pos_embedding(position_ids)
         embeddings = self.dropout(embeddings)
 
-        if attention_mask is not None:
-            padding_mask = attention_mask.logical_not()
-        else:
-            padding_mask = None
+        padding_mask = attention_mask.logical_not() if attention_mask is not None else None
 
         transformer_output = self.layers(embeddings, src_key_padding_mask=padding_mask)
         transformer_output = self.layer_norm(transformer_output)
         logits = self.fc(transformer_output)
         return logits
 
-def tokenize_function(examples, tokenizer, max_length):
+def tokenize_function(examples: Dict[str, List[str]], tokenizer: GPT2Tokenizer, max_length: int) -> Dict[str, List[int]]:
     return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=max_length)
 
 @torch.no_grad()
-def generate_text(model, tokenizer, prompt, device, max_length=50, temperature=0.7, top_k=50, top_p=0.9):
+def generate_text(model: nn.Module, tokenizer: GPT2Tokenizer, prompt: str, device: torch.device, max_length: int = 50, temperature: float = 0.7, top_k: int = 50, top_p: float = 0.9) -> str:
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     generated = input_ids.clone()
     
     for _ in range(max_length):
-        outputs = model(input_ids)
+        outputs = model(generated)
         next_token_logits = outputs[:, -1, :] / temperature
         filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         probabilities = torch.softmax(filtered_logits, dim=-1)
         next_token = torch.multinomial(probabilities, num_samples=1)
         generated = torch.cat((generated, next_token), dim=1)
-        input_ids = next_token
         if next_token.item() == tokenizer.eos_token_id:
             break
     
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
-def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0, filter_value: float = -float('Inf')) -> torch.Tensor:
     top_k = min(top_k, logits.size(-1))
     if top_k > 0:
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
@@ -101,7 +98,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
         logits[indices_to_remove] = filter_value
     return logits
 
-def train_model(model, train_loader, val_loader, optimizer, scheduler, device, num_epochs, tokenizer, writer):
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: optim.Optimizer, scheduler: OneCycleLR, device: torch.device, num_epochs: int, tokenizer: GPT2Tokenizer, writer: SummaryWriter) -> nn.Module:
     criterion = nn.CrossEntropyLoss()
     best_val_loss = float('inf')
     
@@ -139,14 +136,13 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, device, n
             torch.save(model.state_dict(), 'best_small_transformer_model.pth')
             logging.info("New best model saved")
         
-        # Generate sample text
         sample_prompt = "Once upon a time"
         sample_text = generate_text(model, tokenizer, sample_prompt, device)
         logging.info(f"Sample generated text: {sample_text}")
     
     return model
 
-def validate_model(model, val_loader, criterion, device):
+def validate_model(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
     model.eval()
     total_loss = 0
     with torch.no_grad():
@@ -158,16 +154,20 @@ def validate_model(model, val_loader, criterion, device):
             total_loss += loss.item()
     return total_loss / len(val_loader)
 
-def chat_with_model(model, tokenizer, device):
+def chat_with_model(model: nn.Module, tokenizer: GPT2Tokenizer, device: torch.device):
     print("Chat with the model (type 'quit' to exit):")
     while True:
         user_input = input("You: ")
         if user_input.lower() == 'quit':
             break
-        response = generate_text(model, tokenizer, user_input, device, max_length=100)
-        print("Model:", response)
+        try:
+            response = generate_text(model, tokenizer, user_input, device, max_length=100)
+            print("Model:", response)
+        except Exception as e:
+            logging.error(f"Error generating response: {str(e)}")
+            print("Model: I'm sorry, I couldn't generate a response. Please try again.")
 
-def main(args):
+def main(args: argparse.Namespace):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
@@ -175,8 +175,12 @@ def main(args):
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-    dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    logging.info(f"Dataset loaded. Size: {len(dataset)}")
+    try:
+        dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        logging.info(f"Dataset loaded. Size: {len(dataset)}")
+    except Exception as e:
+        logging.error(f"Error loading dataset: {str(e)}")
+        return
 
     max_length = args.max_length
     tokenized_datasets = dataset.map(
@@ -211,10 +215,14 @@ def main(args):
         trained_model = train_model(model, train_loader, val_loader, optimizer, scheduler, device, args.num_epochs, tokenizer, writer)
         torch.save(trained_model.state_dict(), 'final_small_transformer_model.pth')
         logging.info("Final model saved")
-        writer.close()
+        
+        # Validate the model before starting the chat
+        val_loss = validate_model(trained_model, val_loader, nn.CrossEntropyLoss(), device)
+        logging.info(f"Final validation loss: {val_loss:.4f}")
+        
         chat_with_model(trained_model, tokenizer, device)
     except Exception as e:
-        logging.error(f"An error occurred during training: {str(e)}")
+        logging.error(f"An error occurred during training or chat: {str(e)}")
     finally:
         writer.close()
 
