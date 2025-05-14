@@ -1,9 +1,9 @@
-import random
 import spacy
 from collections import Counter
 from torchtext.vocab import build_vocab_from_iterator
 import torch
 import pickle
+import secrets
 
 # Define components of ads
 products = ["shoes", "electronics", "fashion products", "items", "books", "gadgets", 
@@ -49,11 +49,11 @@ structures = [
 def generate_synthetic_ads(num_ads=10000):
     synthetic_ads = []
     for _ in range(num_ads):
-        product = random.choice(products)
-        offer = random.choice(offers)
-        action = random.choice(actions)
-        additional_phrase = random.choice(additional_phrases)
-        structure = random.choice(structures)
+        product = secrets.choice(products)
+        offer = secrets.choice(offers)
+        action = secrets.choice(actions)
+        additional_phrase = secrets.choice(additional_phrases)
+        structure = secrets.choice(structures)
         ad = structure.format(
             offer=offer, product=product, action=action, additional_phrase=additional_phrase
         )

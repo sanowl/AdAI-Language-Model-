@@ -12,9 +12,9 @@ from tqdm import tqdm
 import argparse
 import os
 from typing import List, Dict, Any, Tuple
-import random
 import numpy as np
 from collections import deque
+import secrets
 
 # Set environment variable to fall back to CPU for unsupported operations
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -66,7 +66,7 @@ class SmallTransformerModel(nn.Module):
         return logits
 
 def set_seed(seed: int):
-    random.seed(seed)
+    secrets.SystemRandom().seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -78,7 +78,7 @@ def tokenize_and_augment(examples: Dict[str, List[str]], tokenizer: GPT2Tokenize
     masked_input_ids = []
     for input_ids in tokenized['input_ids']:
         mask_prob = 0.15
-        masked = [token if random.random() > mask_prob else tokenizer.mask_token_id for token in input_ids]
+        masked = [token if secrets.SystemRandom().random() > mask_prob else tokenizer.mask_token_id for token in input_ids]
         masked_input_ids.append(masked)
     
     tokenized['input_ids'] = masked_input_ids
